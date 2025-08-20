@@ -1,144 +1,224 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO.Ports;
+using System.Linq;
 using System.Threading;
 
 namespace FirmataPRSBTestApp
 {
     class Program
     {
-        private static List<(string PortName, bool IsFirmata, string Version)> _portScanResults = new();
+        private static List<(string PortName, bool IsFirmata, string Version, string Profile)> _portScanResults = new();
         private static FirmataClient? _device;
         private static bool _keepRunning = true;
+        private static bool _includeCom1 = false;
 
         static void Main(string[] args)
         {
-            // 1. On startup, search for all COM ports and list them out on the console.
-            var ports = SerialPort.GetPortNames();
-            Console.WriteLine("Available COM Ports:");
-            for (int i = 0; i < ports.Length; i++)
-                Console.WriteLine($"{i}: {ports[i]}");
+            Console.WriteLine("Arduino Firmata Client - Smart Detection");
+            Console.WriteLine("=========================================");
 
-            // 2. Wait for the user to press a key.
-            Console.WriteLine("\nPress any key to scan for Firmata devices...");
-            Console.ReadKey(true);
-
-            // 3. Test each COM port to see if it is a Firmata device, and provide an updated list.
-            _portScanResults.Clear();
-            for (int i = 0; i < ports.Length; i++)
+            while (_keepRunning)
             {
-                string port = ports[i];
-                Console.WriteLine($"Testing {port}: Starting scan...");
-                Console.WriteLine($"Testing {port}: Creating FirmataClient instance...");
-                using var testClient = new FirmataClient(port);
-                bool opened = false;
+                // Scan for available ports
+                ScanPorts(_includeCom1);
+
+                // Let user choose a device from the FIRMATA devices only
+                var firmataDevices = _portScanResults.Where(p => p.IsFirmata).ToList();
+
+                if (firmataDevices.Count == 0)
+                {
+                    Console.WriteLine("No Firmata devices found.");
+                    Console.WriteLine("1. Rescan ports");
+                    Console.WriteLine("2. Exit");
+                    Console.Write("Select option: ");
+
+                    var choice = Console.ReadLine();
+                    if (choice == "2")
+                    {
+                        _keepRunning = false;
+                    }
+                    continue;
+                }
+
+                int selected = SelectDevice(firmataDevices);
+                if (selected == -1)
+                {
+                    _keepRunning = false;
+                    continue;
+                }
+
+                // Connect to selected device using the known working profile
+                var chosenDevice = firmataDevices[selected];
+                _device = new FirmataClient(chosenDevice.PortName, chosenDevice.Profile);
+
+                if (_device.Connect(1)) // Only 1 round needed since we know the profile
+                {
+                    Console.WriteLine($"\nConnected to {chosenDevice.PortName} (Firmata v{_device.Version})");
+                    RunDeviceMenu();
+                }
+                else
+                {
+                    Console.WriteLine("Failed to connect to the selected device.");
+                    Console.WriteLine("Press any key to continue...");
+                    Console.ReadKey();
+                }
+
+                _device?.Dispose();
+                _device = null;
+            }
+
+            Console.WriteLine("Press any key to exit...");
+            Console.ReadKey();
+        }
+
+        private static void ScanPorts(bool includeCom1 = false)
+        {
+            _portScanResults.Clear();
+            var ports = SerialPort.GetPortNames()
+                .OrderBy(p => p)
+                .ToArray();
+
+            Console.WriteLine("\nAvailable COM Ports:");
+            foreach (var port in ports)
+            {
+                Console.WriteLine($"  {port}");
+            }
+
+            if (ports.Length == 0)
+            {
+                Console.WriteLine("No COM ports found!");
+                return;
+            }
+
+            // Filter ports based on includeCom1 flag
+            var portsToScan = includeCom1
+                ? ports
+                : ports.Where(p => !p.Equals("COM1", StringComparison.OrdinalIgnoreCase)).ToArray();
+
+            if (!includeCom1 && ports.Contains("COM1", StringComparer.OrdinalIgnoreCase))
+            {
+                Console.WriteLine("\nNote: COM1 is skipped by default (typically not used for Arduino devices)");
+            }
+
+            Console.WriteLine("\nScanning for Firmata devices...");
+
+            foreach (var port in portsToScan)
+            {
+                Console.WriteLine($"\n=== Testing {port} ===");
+
                 try
                 {
-                    Console.WriteLine($"Testing {port}: Attempting to open serial port...");
-                    // Connect() will open the port and start handshake
-                    Console.WriteLine($"Testing {port}: Calling Connect() to initiate handshake...");
-                    opened = testClient.Connect();
-                    if (opened)
+                    using var testClient = new FirmataClient(port);
+                    bool isConnected = testClient.Connect(2);
+
+                    _portScanResults.Add((port, isConnected,
+                        isConnected ? testClient.Version : "",
+                        isConnected ? testClient.DetectedProfile : ""));
+
+                    if (isConnected)
                     {
-                        Console.WriteLine($"Testing {port}: Handshake complete, Firmata detected.");
-                        Console.WriteLine($"Testing {port}: Reading Firmata version...");
-                        Console.WriteLine($"Testing {port}: Detected Firmata version {testClient.Version}.");
-                        _portScanResults.Add((port, true, testClient.Version));
-                        Console.WriteLine($"Testing {port}: [X] Firmata device confirmed.");
+                        Console.WriteLine($"✓ Firmata v{testClient.Version} detected ({testClient.DetectedProfile} profile)");
                     }
                     else
                     {
-                        Console.WriteLine($"Testing {port}: No Firmata response or handshake failed.");
-                        _portScanResults.Add((port, false, ""));
-                        Console.WriteLine($"Testing {port}: [ ] Not a Firmata device.");
+                        Console.WriteLine("✗ No Firmata device found");
                     }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Testing {port}: Exception occurred: {ex.GetType().Name}: {ex.Message}");
-                    if (ex.InnerException != null)
-                        Console.WriteLine($"Testing {port}: Inner exception: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}");
-                    _portScanResults.Add((port, false, ""));
-                    Console.WriteLine($"Testing {port}: [ ] Not a Firmata device.");
+                    Console.WriteLine($"Error testing {port}: {ex.Message}");
+                    _portScanResults.Add((port, false, "", ""));
                 }
-                finally
-                {
-                    Console.WriteLine($"Testing {port}: Disposing FirmataClient and closing serial port.");
-                    // The using statement ensures disposal
-                }
-                Console.WriteLine($"Testing {port}: Scan complete.\n");
+
+                Thread.Sleep(500);
             }
 
-            // 4. At this stage, no device should be connected to app, but we now know what we have connected and available.
+            Console.WriteLine("\nScan complete.");
+        }
 
-            // 5. Ask the user to choose a device, and then connect to it.
-            int selected = -1;
-            while (selected < 0 || selected >= _portScanResults.Count || !_portScanResults[selected].IsFirmata)
+        private static int SelectDevice(List<(string PortName, bool IsFirmata, string Version, string Profile)> firmataDevices)
+        {
+            Console.WriteLine("\nFirmata Devices Found:");
+            for (int i = 0; i < firmataDevices.Count; i++)
             {
-                Console.Write("\nEnter the number of a Firmata device to connect: ");
-                if (!int.TryParse(Console.ReadLine(), out selected) ||
-                    selected < 0 || selected >= _portScanResults.Count ||
-                    !_portScanResults[selected].IsFirmata)
+                var device = firmataDevices[i];
+                Console.WriteLine($"{i}: {device.PortName} (v{device.Version}) - {device.Profile} profile");
+            }
+
+            Console.WriteLine($"{firmataDevices.Count}: Rescan all ports");
+            Console.WriteLine($"{firmataDevices.Count + 1}: Exit application");
+
+            int selected = -1;
+            while (selected < 0 || selected > firmataDevices.Count + 1)
+            {
+                Console.Write($"\nSelect option (0-{firmataDevices.Count + 1}): ");
+                if (!int.TryParse(Console.ReadLine(), out selected) || selected < 0 || selected > firmataDevices.Count + 1)
                 {
-                    Console.WriteLine("Invalid selection. Please choose a valid Firmata device.");
+                    Console.WriteLine("Invalid selection.");
                     selected = -1;
                 }
             }
 
-            // 6. Show status message for that selected device (Firmata version, connected status)
-            var chosenPort = _portScanResults[selected].PortName;
-            _device = new FirmataClient(chosenPort);
-            if (_device.Connect())
+            if (selected == firmataDevices.Count) // Rescan option
             {
-                Console.WriteLine($"\nConnected to {chosenPort} (Firmata v{_device.Version})");
+                return -2; // Special code for rescan
             }
-            else
+            else if (selected == firmataDevices.Count + 1) // Exit option
             {
-                Console.WriteLine("Failed to connect to the selected device.");
-                return;
+                return -1; // Exit
             }
 
-            // 7. Provide the menu to allow the user to configure/test pins/servos on that device.
-            while (_keepRunning)
-            {
-                ShowMainMenu();
-            }
-
-            _device.Close();
+            return selected;
         }
 
-        private static void ShowMainMenu()
+        private static void RunDeviceMenu()
         {
-            Console.WriteLine("\nAvailable Commands:");
-            Console.WriteLine("1. Set Digital Pin Output");
-            Console.WriteLine("2. Set PWM (Analog) Output");
-            Console.WriteLine("3. Set Servo Position (0-180)");
-            Console.WriteLine("4. Read Version");
-            Console.WriteLine("q. Quit");
-            Console.Write("Enter command: ");
+            bool deviceMenuRunning = true;
 
-            string input = Console.ReadLine();
-
-            switch (input?.ToLower())
+            while (deviceMenuRunning && _keepRunning)
             {
-                case "1":
-                    SetDigitalPinOutput();
-                    break;
-                case "2":
-                    SetPwmOutput();
-                    break;
-                case "3":
-                    SetServoPosition();
-                    break;
-                case "4":
-                    ReadVersion();
-                    break;
-                case "q":
-                    _keepRunning = false;
-                    break;
-                default:
-                    Console.WriteLine("Invalid command.");
-                    break;
+                Console.WriteLine("\n=== DEVICE MENU ===");
+                Console.WriteLine($"Connected to: {_device?.PortName} (Firmata v{_device?.Version})");
+                Console.WriteLine("1. Set Digital Pin Output");
+                Console.WriteLine("2. Set PWM Output");
+                Console.WriteLine("3. Set Servo Position");
+                Console.WriteLine("4. Read Version");
+                Console.WriteLine("5. Test All Functions");
+                Console.WriteLine("6. Switch to different device");
+                Console.WriteLine("7. Rescan ports");
+                Console.WriteLine("8. Exit application");
+                Console.WriteLine("9. Toggle COM1 scanning (Currently: {0})", _includeCom1 ? "Enabled" : "Disabled");
+                Console.Write("Select option: ");
+
+                var input = Console.ReadLine()?.ToLower();
+
+                switch (input)
+                {
+                    case "1": SetDigitalPinOutput(); break;
+                    case "2": SetPwmOutput(); break;
+                    case "3": SetServoPosition(); break;
+                    case "4": ReadVersion(); break;
+                    case "5": TestAllFunctions(); break;
+                    case "6":
+                        deviceMenuRunning = false; // Break out to device selection
+                        break;
+                    case "7":
+                        deviceMenuRunning = false;
+                        _portScanResults.Clear(); // Force rescan
+                        break;
+                    case "8":
+                        deviceMenuRunning = false;
+                        _keepRunning = false;
+                        break;
+                    case "9":
+                        _includeCom1 = !_includeCom1;
+                        Console.WriteLine($"COM1 scanning is now {(_includeCom1 ? "enabled" : "disabled")}");
+                        break;
+                    default:
+                        Console.WriteLine("Invalid option");
+                        break;
+                }
             }
         }
 
@@ -163,7 +243,6 @@ namespace FirmataPRSBTestApp
             try
             {
                 _device.SetDigitalPinOutput(pin, value);
-                Console.WriteLine($"Set pin {pin} to {value}");
             }
             catch (Exception ex)
             {
@@ -192,7 +271,6 @@ namespace FirmataPRSBTestApp
             try
             {
                 _device.SetPwmOutput(pin, value);
-                Console.WriteLine($"Set PWM pin {pin} to {value}");
             }
             catch (Exception ex)
             {
@@ -221,7 +299,6 @@ namespace FirmataPRSBTestApp
             try
             {
                 _device.SetServoPosition(pin, angle);
-                Console.WriteLine($"Set servo on pin {pin} to {angle} degrees");
             }
             catch (Exception ex)
             {
@@ -236,12 +313,52 @@ namespace FirmataPRSBTestApp
             try
             {
                 _device.ReadVersion();
-                Thread.Sleep(1000);
+                Thread.Sleep(1000); // Wait for response
                 Console.WriteLine($"Firmata version: {_device.Version}");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error requesting version: {ex.Message}");
+                Console.WriteLine($"Error reading version: {ex.Message}");
+            }
+        }
+
+        private static void TestAllFunctions()
+        {
+            if (_device == null) return;
+
+            Console.WriteLine("\nTesting all functions...");
+
+            try
+            {
+                // Test digital output (pin 13 usually has LED)
+                Console.WriteLine("Testing digital output on pin 13...");
+                _device.SetDigitalPinOutput(13, 1);
+                Thread.Sleep(1000);
+                _device.SetDigitalPinOutput(13, 0);
+
+                // Test PWM (pin 9 or 10 typically)
+                Console.WriteLine("Testing PWM on pin 9...");
+                for (int i = 0; i <= 255; i += 10)
+                {
+                    _device.SetPwmOutput(9, i);
+                    Thread.Sleep(50);
+                }
+                _device.SetPwmOutput(9, 0);
+
+                // Test servo (pin 5 typically)
+                Console.WriteLine("Testing servo on pin 5...");
+                for (int angle = 0; angle <= 180; angle += 10)
+                {
+                    _device.SetServoPosition(5, angle);
+                    Thread.Sleep(100);
+                }
+                _device.SetServoPosition(5, 90);
+
+                Console.WriteLine("All tests completed successfully!");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Test failed: {ex.Message}");
             }
         }
     }

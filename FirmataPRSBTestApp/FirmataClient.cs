@@ -1,345 +1,536 @@
 ﻿using System;
 using System.IO.Ports;
+using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 
 namespace FirmataPRSBTestApp
 {
-    /// <summary>
-    /// Represents a connection to an Arduino board running the Firmata protocol.
-    /// Provides methods to control digital, PWM, and servo pins, and to query the firmware version.
-    /// </summary>
     public class FirmataClient : IDisposable
     {
         private SerialPort _port;
-        private bool _firmataDetected;
+        private bool _disposed = false;
+        private bool _firmataDetected = false;
+        private string _successfulProfile = null;
+
         public string PortName { get; }
         public bool IsConnected => _port?.IsOpen ?? false;
         public string Version { get; private set; } = "Unknown";
+        public string DetectedProfile => _successfulProfile;
 
         // Firmata command bytes
+        private const byte REPORT_VERSION = 0xF9;
+        private const byte SET_PIN_MODE = 0xF4;
         private const byte DIGITAL_MESSAGE = 0x90;
         private const byte ANALOG_MESSAGE = 0xE0;
-        private const byte SET_PIN_MODE = 0xF4;
-        private const byte REPORT_VERSION = 0xF9;
+
+        // Pin modes
         private const byte PIN_MODE_OUTPUT = 0x01;
         private const byte PIN_MODE_PWM = 0x03;
         private const byte PIN_MODE_SERVO = 0x04;
 
-        public FirmataClient(string portName)
+        private HashSet<int> _configuredPins = new HashSet<int>();
+
+        public FirmataClient(string portName, string knownProfile = null)
         {
             PortName = portName;
+            _successfulProfile = knownProfile; // Remember which profile worked before
         }
 
-        //public bool Connect()
-        //{
-        //    try
-        //    {
-        //        Console.WriteLine($"Testing {PortName}: [Connect] Releasing port if stuck...");
-        //        ForceReleasePort(PortName);
-
-        //        Console.WriteLine($"Testing {PortName}: [Connect] Creating SerialPort instance...");
-        //        _port = new SerialPort(PortName, 115200, Parity.None, 8, StopBits.One)
-        //        {
-        //            DtrEnable = true,
-        //            RtsEnable = true
-        //        };
-        //        _port.DataReceived += Port_DataReceived;
-
-        //        Console.WriteLine($"Testing {PortName}: [Connect] Opening serial port...");
-        //        _port.Open();
-
-        //        Console.WriteLine($"Testing {PortName}: [Connect] Waiting for Arduino to boot (3s)...");
-        //        Thread.Sleep(3000);
-
-        //        Console.WriteLine($"Testing {PortName}: [Connect] Discarding any startup data...");
-        //        _port.DiscardInBuffer();
-
-        //        _firmataDetected = false;
-        //        Console.WriteLine($"Testing {PortName}: [Connect] Sending Firmata version request: F9");
-        //        _port.Write(new byte[] { REPORT_VERSION }, 0, 1);
-
-        //        for (int i = 0; i < 20; i++)
-        //        {
-        //            Console.WriteLine($"Testing {PortName}: [Connect] Waiting for Firmata reply... ({i + 1}/20)");
-        //            Thread.Sleep(250);
-        //            if (_firmataDetected)
-        //            {
-        //                Console.WriteLine($"Testing {PortName}: [Connect] Firmata version reply received.");
-        //                break;
-        //            }
-        //            if (i % 4 == 0)
-        //            {
-        //                Console.WriteLine($"Testing {PortName}: [Connect] Re-sending version request: F9");
-        //                _port.Write(new byte[] { REPORT_VERSION }, 0, 1);
-        //            }
-        //        }
-
-        //        if (!_firmataDetected)
-        //        {
-        //            Console.WriteLine($"Testing {PortName}: [Connect] No Firmata reply received after waiting.");
-        //        }
-
-        //        return _firmataDetected;
-        //    }
-        //    catch (Exception ex)
-        //    {
-        //        Console.WriteLine($"Testing {PortName}: [Connect] Exception: {ex.GetType().Name}: {ex.Message}");
-        //        Close();
-        //        return false;
-        //    }
-        //}
-
-        public bool Connect()
+        public bool Connect(int maxRounds = 2)
         {
-            const int maxAttempts = 10;
-            const int retryDelayMs = 500;
-            int attempt = 0;
+            // If we already know which profile works, use it directly
+            if (!string.IsNullOrEmpty(_successfulProfile))
+            {
+                Console.WriteLine($"Using known successful profile: {_successfulProfile}");
+                return TryConnectWithProfile(_successfulProfile, 3); // 3 attempts with known profile
+            }
 
-            // Helper to check if port exists
-            static bool PortExists(string portName)
-                => Array.Exists(SerialPort.GetPortNames(), p => p == portName);
+            // Try different board profiles in rounds (each profile once per round)
+            string[] boardProfiles = { "Standard", "Mega", "Leonardo", "ESP8266" };
 
-            while (attempt < maxAttempts)
+            for (int round = 1; round <= maxRounds; round++)
+            {
+                Console.WriteLine($"\n=== Connection Round {round}/{maxRounds} ===");
+
+                foreach (var profile in boardProfiles)
+                {
+                    try
+                    {
+                        Console.WriteLine($"Trying {profile} profile...");
+
+                        if (TryConnectWithProfile(profile, 1)) // Only 1 attempt per profile per round
+                        {
+                            _successfulProfile = profile; // Remember which profile worked
+                            Console.WriteLine($"✓ Success! Connected using {profile} profile");
+                            return true;
+                        }
+
+                        Console.WriteLine($"✗ {profile} profile failed in round {round}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error with {profile} profile: {ex.Message}");
+                        Close();
+                    }
+
+                    Thread.Sleep(500); // Short delay between profiles
+                }
+
+                if (round < maxRounds)
+                {
+                    Console.WriteLine("Waiting before next round...");
+                    Thread.Sleep(1000);
+                }
+            }
+
+            Console.WriteLine($"✗ Failed to connect to {PortName} after {maxRounds} rounds");
+            return false;
+        }
+
+        //private bool TryConnectWithProfile(string profile, int maxAttempts = 1)
+        //{
+        //    for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        //    {
+        //        Close(); // Clean up any previous connection
+
+        //        if (!SerialPort.GetPortNames().Contains(PortName))
+        //        {
+        //            Console.WriteLine($"Port {PortName} not available");
+        //            return false;
+        //        }
+
+        //        try
+        //        {
+        //            _port = new SerialPort(PortName, 115200)
+        //            {
+        //                DtrEnable = true,
+        //                RtsEnable = true,
+        //                ReadTimeout = 5000,
+        //                WriteTimeout = 3000,
+        //                NewLine = "\n"
+        //            };
+
+        //            _port.DataReceived += Port_DataReceived;
+
+        //            // Apply profile-specific connection strategy
+        //            switch (profile.ToLower())
+        //            {
+        //                case "leonardo":
+        //                    if (attempt == 1) Console.WriteLine("Applying Leonardo profile (open/close reset)");
+        //                    _port.Open();
+        //                    Thread.Sleep(100);
+        //                    _port.Close();
+        //                    Thread.Sleep(1500);
+        //                    _port.Open();
+        //                    Thread.Sleep(3000);
+        //                    break;
+
+        //                case "mega":
+        //                    if (attempt == 1) Console.WriteLine("Applying Mega profile (long reset wait)");
+        //                    _port.Open();
+        //                    Thread.Sleep(4500);
+        //                    break;
+
+        //                default: // "standard"
+        //                    if (attempt == 1) Console.WriteLine("Applying Standard profile");
+        //                    _port.Open();
+        //                    Thread.Sleep(2000);
+        //                    break;
+        //            }
+
+        //            // Clear any buffered data
+        //            _port.DiscardInBuffer();
+        //            _port.DiscardOutBuffer();
+
+        //            // Try to detect Firmata
+        //            if (DetectFirmata(profile))
+        //            {
+        //                return true;
+        //            }
+
+        //            Close();
+        //        }
+        //        catch (Exception)
+        //        {
+        //            Close();
+        //            if (attempt == maxAttempts) throw;
+        //        }
+
+        //        if (attempt < maxAttempts)
+        //        {
+        //            Console.WriteLine($"Retrying {profile} profile (attempt {attempt + 1}/{maxAttempts})...");
+        //            Thread.Sleep(800);
+        //        }
+        //    }
+
+        //    return false;
+        //}
+        private bool TryConnectWithProfile(string profile, int maxAttempts = 1)
+        {
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                Close(); // Clean up any previous connection
+
+                if (!SerialPort.GetPortNames().Contains(PortName))
+                {
+                    Console.WriteLine($"Port {PortName} not available");
+                    return false;
+                }
+
+                try
+                {
+                    _port = new SerialPort(PortName, 115200)
+                    {
+                        DtrEnable = true,
+                        RtsEnable = true,
+                        ReadTimeout = 5000,
+                        WriteTimeout = 3000,
+                        NewLine = "\n"
+                    };
+
+                    _port.DataReceived += Port_DataReceived;
+
+                    // Apply profile-specific connection strategy
+                    switch (profile.ToLower())
+                    {
+                        case "leonardo":
+                            if (attempt == 1) Console.WriteLine("Applying Leonardo profile (open/close reset)");
+                            _port.Open();
+                            Thread.Sleep(100);
+                            _port.Close();
+                            Thread.Sleep(1500);
+                            _port.Open();
+                            Thread.Sleep(3000);
+                            break;
+
+                        case "mega":
+                            if (attempt == 1) Console.WriteLine("Applying Mega profile (long reset wait)");
+                            _port.Open();
+                            Thread.Sleep(4500);
+                            break;
+
+                        case "esp8266":
+                            if (attempt == 1) Console.WriteLine("Applying ESP8266 profile (advanced reset sequence)");
+
+                            // Advanced ESP8266 reset sequence
+                            _port.DtrEnable = false;
+                            _port.RtsEnable = false;
+                            _port.Open();
+
+                            // Toggle DTR/RTS to ensure proper reset
+                            Thread.Sleep(100);
+                            _port.DtrEnable = true;
+                            Thread.Sleep(100);
+                            _port.DtrEnable = false;
+                            Thread.Sleep(100);
+                            _port.RtsEnable = true;
+                            Thread.Sleep(100);
+                            _port.RtsEnable = false;
+                            Thread.Sleep(1500); // Wait for boot
+
+                            // Sometimes need to close and reopen
+                            _port.Close();
+                            Thread.Sleep(500);
+                            _port.Open();
+                            Thread.Sleep(2000);
+                            break;
+
+                        default: // "standard"
+                            if (attempt == 1) Console.WriteLine("Applying Standard profile");
+                            _port.Open();
+                            Thread.Sleep(2000);
+                            break;
+                    }
+
+                    // Clear any buffered data
+                    _port.DiscardInBuffer();
+                    _port.DiscardOutBuffer();
+
+                    // Try to detect Firmata
+                    if (DetectFirmata(profile))
+                    {
+                        return true;
+                    }
+
+                    Close();
+                }
+                catch (Exception)
+                {
+                    Close();
+                    if (attempt == maxAttempts) throw;
+                }
+
+                if (attempt < maxAttempts)
+                {
+                    Console.WriteLine($"Retrying {profile} profile (attempt {attempt + 1}/{maxAttempts})...");
+                    Thread.Sleep(800);
+                }
+            }
+
+            return false;
+        }
+        //private bool DetectFirmata(string profile)
+        //{
+        //    _firmataDetected = false;
+        //    Version = "Unknown";
+
+        //    // Adjust detection parameters based on profile
+        //    int maxAttempts;
+        //    int delayPerCheck;
+
+        //    switch (profile.ToLower())
+        //    {
+        //        case "leonardo":
+        //            maxAttempts = 8;
+        //            delayPerCheck = 100;
+        //            break;
+        //        case "mega":
+        //            maxAttempts = 12;
+        //            delayPerCheck = 200;
+        //            break;
+        //        default:
+        //            maxAttempts = 6;
+        //            delayPerCheck = 150;
+        //            break;
+        //    }
+
+        //    for (int i = 0; i < maxAttempts; i++)
+        //    {
+        //        try
+        //        {
+        //            if (_port == null || !_port.IsOpen) return false;
+
+        //            _port.Write(new byte[] { REPORT_VERSION }, 0, 1);
+
+        //            // Wait for response
+        //            for (int j = 0; j < 20; j++)
+        //            {
+        //                Thread.Sleep(delayPerCheck);
+        //                if (_firmataDetected)
+        //                {
+        //                    return true;
+        //                }
+        //            }
+        //        }
+        //        catch (Exception ex)
+        //        {
+        //            Console.WriteLine($"Error during detection: {ex.Message}");
+        //            return false;
+        //        }
+        //    }
+
+        //    return false;
+        //}
+        private bool DetectFirmata(string profile)
+        {
+            _firmataDetected = false;
+            Version = "Unknown";
+
+            // Adjust detection parameters based on profile
+            int maxAttempts;
+            int delayPerCheck;
+
+            switch (profile.ToLower())
+            {
+                case "leonardo":
+                    maxAttempts = 8;
+                    delayPerCheck = 100;
+                    break;
+                case "mega":
+                    maxAttempts = 12;
+                    delayPerCheck = 200;
+                    break;
+                case "esp8266":
+                    maxAttempts = 10;    // ESP8266 may respond differently
+                    delayPerCheck = 150;
+                    break;
+                default:
+                    maxAttempts = 6;
+                    delayPerCheck = 150;
+                    break;
+            }
+
+            for (int i = 0; i < maxAttempts; i++)
             {
                 try
                 {
-                    Console.WriteLine($"Testing {PortName}: [Connect] Attempt {attempt + 1}/{maxAttempts} - Releasing port if stuck...");
-                    ForceReleasePort(PortName);
+                    if (_port == null || !_port.IsOpen) return false;
 
-                    Console.WriteLine($"Testing {PortName}: [Connect] Creating SerialPort instance...");
-                    _port = new SerialPort(PortName, 115200, Parity.None, 8, StopBits.One)
+                    _port.Write(new byte[] { REPORT_VERSION }, 0, 1);
+
+                    // Wait for response
+                    for (int j = 0; j < 20; j++)
                     {
-                        DtrEnable = true,
-                        RtsEnable = true
-                    };
-                    _port.DataReceived += Port_DataReceived;
-
-                    Console.WriteLine($"Testing {PortName}: [Connect] Opening serial port...");
-                    _port.Open();
-
-                    // Wait briefly to see if the port disappears (Leonardo/Micro)
-                    bool portDisappeared = false;
-                    int waited = 0;
-                    for (; waited < 2000; waited += 100)
-                    {
-                        Thread.Sleep(100);
-                        if (!PortExists(PortName))
+                        Thread.Sleep(delayPerCheck);
+                        if (_firmataDetected)
                         {
-                            portDisappeared = true;
-                            break;
+                            return true;
                         }
                     }
-
-                    if (portDisappeared)
-                    {
-                        Console.WriteLine($"Testing {PortName}: [Connect] Port disappeared, waiting for it to reappear...");
-                        waited = 0;
-                        while (!PortExists(PortName) && waited < 5000)
-                        {
-                            Thread.Sleep(100);
-                            waited += 100;
-                        }
-                        // After reappear, close and reopen the port
-                        try { _port.Close(); } catch { }
-                        _port.Dispose();
-                        _port = new SerialPort(PortName, 115200, Parity.None, 8, StopBits.One)
-                        {
-                            DtrEnable = true,
-                            RtsEnable = true
-                        };
-                        _port.DataReceived += Port_DataReceived;
-                        _port.Open();
-                    }
-
-                    break; // Success!
-                }
-                catch (UnauthorizedAccessException)
-                {
-                    Console.WriteLine($"Testing {PortName}: [Connect] Access denied (port in use or not ready). Retrying in {retryDelayMs}ms...");
-                    Thread.Sleep(retryDelayMs);
-                    attempt++;
-                    if (_port != null)
-                    {
-                        try { _port.Dispose(); } catch { }
-                        _port = null;
-                    }
-                    continue;
-                }
-                catch (IOException ex)
-                {
-                    Console.WriteLine($"Testing {PortName}: [Connect] IO exception: {ex.Message}. Retrying in {retryDelayMs}ms...");
-                    Thread.Sleep(retryDelayMs);
-                    attempt++;
-                    if (_port != null)
-                    {
-                        try { _port.Dispose(); } catch { }
-                        _port = null;
-                    }
-                    continue;
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Testing {PortName}: [Connect] Exception: {ex.GetType().Name}: {ex.Message}");
-                    Close();
+                    Console.WriteLine($"Error during detection: {ex.Message}");
                     return false;
                 }
             }
 
-            if (_port == null || !_port.IsOpen)
-            {
-                Console.WriteLine($"Testing {PortName}: [Connect] Could not open port after {maxAttempts} attempts.");
-                return false;
-            }
-
+            return false;
+        }
+        private void Port_DataReceived(object sender, SerialDataReceivedEventArgs e)
+        {
             try
             {
-                Console.WriteLine($"Testing {PortName}: [Connect] Waiting for Arduino to boot (3s)...");
-                Thread.Sleep(3000);
+                if (_port == null || !_port.IsOpen) return;
 
-                Console.WriteLine($"Testing {PortName}: [Connect] Discarding any startup data...");
-                _port.DiscardInBuffer();
+                int bytesToRead = _port.BytesToRead;
+                if (bytesToRead <= 0) return;
 
-                _firmataDetected = false;
-                Console.WriteLine($"Testing {PortName}: [Connect] Sending Firmata version request: F9");
-                _port.Write(new byte[] { REPORT_VERSION }, 0, 1);
+                byte[] buffer = new byte[bytesToRead];
+                int bytesRead = _port.Read(buffer, 0, bytesToRead);
 
-                for (int i = 0; i < 20; i++)
+                // Parse for version response (0xF9 followed by major.minor)
+                for (int i = 0; i < bytesRead - 2; i++)
                 {
-                    Console.WriteLine($"Testing {PortName}: [Connect] Waiting for Firmata reply... ({i + 1}/20)");
-                    Thread.Sleep(250);
-                    if (_firmataDetected)
+                    if (buffer[i] == REPORT_VERSION)
                     {
-                        Console.WriteLine($"Testing {PortName}: [Connect] Firmata version reply received.");
+                        byte major = buffer[i + 1];
+                        byte minor = buffer[i + 2];
+                        Version = $"{major}.{minor}";
+                        _firmataDetected = true;
+                        Console.WriteLine($"✓ Detected Firmata version: {Version}");
                         break;
                     }
-                    if (i % 4 == 0)
-                    {
-                        Console.WriteLine($"Testing {PortName}: [Connect] Re-sending version request: F9");
-                        _port.Write(new byte[] { REPORT_VERSION }, 0, 1);
-                    }
                 }
-
-                if (!_firmataDetected)
-                {
-                    Console.WriteLine($"Testing {PortName}: [Connect] No Firmata reply received after waiting.");
-                }
-
-                return _firmataDetected;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Testing {PortName}: [Connect] Exception after open: {ex.GetType().Name}: {ex.Message}");
-                Close();
-                return false;
+                Console.WriteLine($"Error in data received: {ex.Message}");
             }
         }
+
         public void SetDigitalPinOutput(int pin, int value)
         {
-            _port.Write(new byte[] { SET_PIN_MODE, (byte)pin, PIN_MODE_OUTPUT }, 0, 3);
-            Thread.Sleep(100);
+            if (!IsConnected) throw new InvalidOperationException("Not connected");
+
+            // Configure pin mode if not already done
+            if (!_configuredPins.Contains(pin))
+            {
+                _port.Write(new byte[] { SET_PIN_MODE, (byte)pin, PIN_MODE_OUTPUT }, 0, 3);
+                Thread.Sleep(50);
+                _configuredPins.Add(pin);
+            }
+
+            // Send digital write command
             byte port = (byte)(pin / 8);
             byte pinMask = (byte)(1 << (pin % 8));
             byte portValue = (byte)(value == 1 ? pinMask : 0);
-            _port.Write(new byte[] { (byte)(DIGITAL_MESSAGE | port), (byte)(portValue & 0x7F), (byte)(portValue >> 7) }, 0, 3);
+
+            _port.Write(new byte[] {
+                (byte)(DIGITAL_MESSAGE | port),
+                (byte)(portValue & 0x7F),
+                (byte)(portValue >> 7)
+            }, 0, 3);
+
+            Console.WriteLine($"Set digital pin {pin} to {value}");
         }
 
         public void SetPwmOutput(int pin, int value)
         {
-            _port.Write(new byte[] { SET_PIN_MODE, (byte)pin, PIN_MODE_PWM }, 0, 3);
-            Thread.Sleep(100);
-            _port.Write(new byte[] { (byte)(ANALOG_MESSAGE | pin), (byte)(value & 0x7F), (byte)(value >> 7) }, 0, 3);
+            if (!IsConnected) throw new InvalidOperationException("Not connected");
+
+            // Configure pin mode if not already done
+            if (!_configuredPins.Contains(pin))
+            {
+                _port.Write(new byte[] { SET_PIN_MODE, (byte)pin, PIN_MODE_PWM }, 0, 3);
+                Thread.Sleep(50);
+                _configuredPins.Add(pin);
+            }
+
+            // Send PWM value (0-255)
+            value = Math.Max(0, Math.Min(255, value)); // Clamp value
+
+            _port.Write(new byte[] {
+                (byte)(ANALOG_MESSAGE | (pin & 0x0F)),
+                (byte)(value & 0x7F),
+                (byte)(value >> 7)
+            }, 0, 3);
+
+            Console.WriteLine($"Set PWM pin {pin} to {value}");
         }
 
-        private HashSet<int> _servoPins = new HashSet<int>();
         public void SetServoPosition(int pin, int angle)
         {
-            if (!_servoPins.Contains(pin))
+            if (!IsConnected) throw new InvalidOperationException("Not connected");
+
+            // Configure pin mode if not already done
+            if (!_configuredPins.Contains(pin))
             {
                 _port.Write(new byte[] { SET_PIN_MODE, (byte)pin, PIN_MODE_SERVO }, 0, 3);
-                Thread.Sleep(100);
-                _servoPins.Add(pin);
+                Thread.Sleep(50);
+                _configuredPins.Add(pin);
             }
+
+            // Send servo angle (0-180)
+            angle = Math.Max(0, Math.Min(180, angle)); // Clamp angle
+
             _port.Write(new byte[] {
                 (byte)(ANALOG_MESSAGE | (pin & 0x0F)),
                 (byte)(angle & 0x7F),
                 (byte)(angle >> 7)
             }, 0, 3);
+
+            Console.WriteLine($"Set servo pin {pin} to {angle}°");
         }
 
         public void ReadVersion()
         {
+            if (!IsConnected) throw new InvalidOperationException("Not connected");
+
             _port.Write(new byte[] { REPORT_VERSION }, 0, 1);
+            Console.WriteLine("Version request sent");
         }
 
         public void Close()
         {
-            if (_port != null)
+            try
             {
-                try
+                if (_port != null)
                 {
+                    _port.DataReceived -= Port_DataReceived;
                     if (_port.IsOpen)
                         _port.Close();
                     _port.Dispose();
-                    _port = null;
-                }
-                catch { }
-            }
-        }
-
-        public void Dispose() => Close();
-
-        private void Port_DataReceived(object sender, SerialDataReceivedEventArgs e)
-        {
-            try
-            {
-                int bytesToRead = _port.BytesToRead;
-                if (bytesToRead > 0)
-                {
-                    byte[] buffer = new byte[bytesToRead];
-                    _port.Read(buffer, 0, bytesToRead);
-
-                    Console.WriteLine($"Testing {PortName}: [DataReceived] Received {bytesToRead} bytes: {BitConverter.ToString(buffer)}");
-
-                    for (int i = 0; i < buffer.Length; i++)
-                    {
-                        byte b = buffer[i];
-                        if (b == REPORT_VERSION && i + 2 < buffer.Length)
-                        {
-                            byte major = buffer[i + 1];
-                            byte minor = buffer[i + 2];
-                            Version = $"{major}.{minor}";
-                            _firmataDetected = true;
-                            Console.WriteLine($"Testing {PortName}: [DataReceived] Parsed Firmata version: {Version}");
-                            i += 2;
-                        }
-                        else
-                        {
-                            Console.WriteLine($"Testing {PortName}: [DataReceived] Unhandled byte: {b:X2}");
-                        }
-                    }
-                }
-                else
-                {
-                    Console.WriteLine($"Testing {PortName}: [DataReceived] No data received.");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Testing {PortName}: [DataReceived] Exception: {ex.GetType().Name}: {ex.Message}");
+                Console.WriteLine($"Error closing port: {ex.Message}");
+            }
+            finally
+            {
+                _port = null;
+                _configuredPins.Clear();
             }
         }
 
-        private static void ForceReleasePort(string portName)
+        public void Dispose()
         {
-            try
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (!_disposed)
             {
-                using (SerialPort testPort = new SerialPort(portName, 9600))
+                if (disposing)
                 {
-                    testPort.Open();
-                    testPort.Close();
+                    Close();
                 }
+                _disposed = true;
             }
-            catch { }
         }
     }
 }
