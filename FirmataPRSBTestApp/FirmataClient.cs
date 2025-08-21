@@ -17,6 +17,7 @@ namespace FirmataPRSBTestApp
         public bool IsConnected => _port?.IsOpen ?? false;
         public string Version { get; private set; } = "Unknown";
         public string DetectedProfile => _successfulProfile;
+        public string DetectedDeviceType { get; private set; } = "Unknown";
 
         // Firmata command bytes
         private const byte REPORT_VERSION = 0xF9;
@@ -37,31 +38,85 @@ namespace FirmataPRSBTestApp
             _successfulProfile = knownProfile; // Remember which profile worked before
         }
 
-        public bool Connect(int maxRounds = 2)
+        public bool ConnectWithDeviceType(string deviceType)
+        {
+            DetectedDeviceType = deviceType;
+
+            // Use device-specific connection strategy
+            return deviceType.ToLower() switch
+            {
+                var t when t.Contains("mega") => ConnectWithProfile("Mega", 3),
+                var t when t.Contains("leonardo") => ConnectWithProfile("Leonardo", 3),
+                var t when t.Contains("esp8266") || t.Contains("esp32") => ConnectWithProfile("ESP8266", 3),
+                var t when t.Contains("nano") => ConnectWithProfile("Standard", 2),
+                var t when t.Contains("uno") => ConnectWithProfile("Standard", 2),
+                _ => Connect(2) // Fallback to auto-detection
+            };
+        }
+
+        private bool ConnectWithProfile(string profile, int attempts)
+        {
+            for (int i = 0; i < attempts; i++)
+            {
+                try
+                {
+                    if (TryConnectWithProfile(profile))
+                    {
+                        _successfulProfile = profile;
+                        return true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Attempt {i + 1} failed: {ex.Message}");
+                }
+
+                if (i < attempts - 1)
+                {
+                    Thread.Sleep(1000);
+                    Close();
+                }
+            }
+
+            return false;
+        }
+
+        public bool Connect(int maxRounds = 2, string preferredProfile = null)
         {
             // If we already know which profile works, use it directly
             if (!string.IsNullOrEmpty(_successfulProfile))
             {
                 Console.WriteLine($"Using known successful profile: {_successfulProfile}");
-                return TryConnectWithProfile(_successfulProfile, 3); // 3 attempts with known profile
+                return TryConnectWithProfile(_successfulProfile, 3);
             }
 
-            // Try different board profiles in rounds (each profile once per round)
-            string[] boardProfiles = { "Standard", "Mega", "Leonardo", "ESP8266" };
+            // List all profiles
+            var allProfiles = new List<string> { "Standard", "Mega", "Leonardo", "ESP8266" };
+
+            // If a preferred profile is provided, move it to the front
+            if (!string.IsNullOrEmpty(preferredProfile))
+            {
+                var match = allProfiles.FirstOrDefault(p => preferredProfile.ToLower().Contains(p.ToLower()));
+                if (match != null)
+                {
+                    allProfiles.Remove(match);
+                    allProfiles.Insert(0, match);
+                }
+            }
 
             for (int round = 1; round <= maxRounds; round++)
             {
                 Console.WriteLine($"\n=== Connection Round {round}/{maxRounds} ===");
 
-                foreach (var profile in boardProfiles)
+                foreach (var profile in allProfiles)
                 {
                     try
                     {
                         Console.WriteLine($"Trying {profile} profile...");
 
-                        if (TryConnectWithProfile(profile, 1)) // Only 1 attempt per profile per round
+                        if (TryConnectWithProfile(profile, 1))
                         {
-                            _successfulProfile = profile; // Remember which profile worked
+                            _successfulProfile = profile;
                             Console.WriteLine($"✓ Success! Connected using {profile} profile");
                             return true;
                         }
@@ -74,7 +129,7 @@ namespace FirmataPRSBTestApp
                         Close();
                     }
 
-                    Thread.Sleep(500); // Short delay between profiles
+                    Thread.Sleep(500);
                 }
 
                 if (round < maxRounds)
@@ -88,84 +143,7 @@ namespace FirmataPRSBTestApp
             return false;
         }
 
-        //private bool TryConnectWithProfile(string profile, int maxAttempts = 1)
-        //{
-        //    for (int attempt = 1; attempt <= maxAttempts; attempt++)
-        //    {
-        //        Close(); // Clean up any previous connection
-
-        //        if (!SerialPort.GetPortNames().Contains(PortName))
-        //        {
-        //            Console.WriteLine($"Port {PortName} not available");
-        //            return false;
-        //        }
-
-        //        try
-        //        {
-        //            _port = new SerialPort(PortName, 115200)
-        //            {
-        //                DtrEnable = true,
-        //                RtsEnable = true,
-        //                ReadTimeout = 5000,
-        //                WriteTimeout = 3000,
-        //                NewLine = "\n"
-        //            };
-
-        //            _port.DataReceived += Port_DataReceived;
-
-        //            // Apply profile-specific connection strategy
-        //            switch (profile.ToLower())
-        //            {
-        //                case "leonardo":
-        //                    if (attempt == 1) Console.WriteLine("Applying Leonardo profile (open/close reset)");
-        //                    _port.Open();
-        //                    Thread.Sleep(100);
-        //                    _port.Close();
-        //                    Thread.Sleep(1500);
-        //                    _port.Open();
-        //                    Thread.Sleep(3000);
-        //                    break;
-
-        //                case "mega":
-        //                    if (attempt == 1) Console.WriteLine("Applying Mega profile (long reset wait)");
-        //                    _port.Open();
-        //                    Thread.Sleep(4500);
-        //                    break;
-
-        //                default: // "standard"
-        //                    if (attempt == 1) Console.WriteLine("Applying Standard profile");
-        //                    _port.Open();
-        //                    Thread.Sleep(2000);
-        //                    break;
-        //            }
-
-        //            // Clear any buffered data
-        //            _port.DiscardInBuffer();
-        //            _port.DiscardOutBuffer();
-
-        //            // Try to detect Firmata
-        //            if (DetectFirmata(profile))
-        //            {
-        //                return true;
-        //            }
-
-        //            Close();
-        //        }
-        //        catch (Exception)
-        //        {
-        //            Close();
-        //            if (attempt == maxAttempts) throw;
-        //        }
-
-        //        if (attempt < maxAttempts)
-        //        {
-        //            Console.WriteLine($"Retrying {profile} profile (attempt {attempt + 1}/{maxAttempts})...");
-        //            Thread.Sleep(800);
-        //        }
-        //    }
-
-        //    return false;
-        //}
+       
         private bool TryConnectWithProfile(string profile, int maxAttempts = 1)
         {
             for (int attempt = 1; attempt <= maxAttempts; attempt++)
@@ -270,58 +248,7 @@ namespace FirmataPRSBTestApp
 
             return false;
         }
-        //private bool DetectFirmata(string profile)
-        //{
-        //    _firmataDetected = false;
-        //    Version = "Unknown";
-
-        //    // Adjust detection parameters based on profile
-        //    int maxAttempts;
-        //    int delayPerCheck;
-
-        //    switch (profile.ToLower())
-        //    {
-        //        case "leonardo":
-        //            maxAttempts = 8;
-        //            delayPerCheck = 100;
-        //            break;
-        //        case "mega":
-        //            maxAttempts = 12;
-        //            delayPerCheck = 200;
-        //            break;
-        //        default:
-        //            maxAttempts = 6;
-        //            delayPerCheck = 150;
-        //            break;
-        //    }
-
-        //    for (int i = 0; i < maxAttempts; i++)
-        //    {
-        //        try
-        //        {
-        //            if (_port == null || !_port.IsOpen) return false;
-
-        //            _port.Write(new byte[] { REPORT_VERSION }, 0, 1);
-
-        //            // Wait for response
-        //            for (int j = 0; j < 20; j++)
-        //            {
-        //                Thread.Sleep(delayPerCheck);
-        //                if (_firmataDetected)
-        //                {
-        //                    return true;
-        //                }
-        //            }
-        //        }
-        //        catch (Exception ex)
-        //        {
-        //            Console.WriteLine($"Error during detection: {ex.Message}");
-        //            return false;
-        //        }
-        //    }
-
-        //    return false;
-        //}
+        
         private bool DetectFirmata(string profile)
         {
             _firmataDetected = false;

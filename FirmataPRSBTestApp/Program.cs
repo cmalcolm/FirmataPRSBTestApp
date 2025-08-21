@@ -8,22 +8,23 @@ namespace FirmataPRSBTestApp
 {
     class Program
     {
-        private static List<(string PortName, bool IsFirmata, string Version, string Profile)> _portScanResults = new();
+        private static List<(string PortName, bool IsFirmata, string Version, string Profile, string DeviceType)> _portScanResults = new();
         private static FirmataClient? _device;
         private static bool _keepRunning = true;
         private static bool _includeCom1 = false;
 
+        
         static void Main(string[] args)
         {
-            Console.WriteLine("Arduino Firmata Client - Smart Detection");
-            Console.WriteLine("=========================================");
+            Console.WriteLine("Arduino Firmata Client - Smart Registry Detection");
+            Console.WriteLine("=================================================");
 
             while (_keepRunning)
             {
-                // Scan for available ports
-                ScanPorts(_includeCom1);
+                // Scan for devices using Registry first
+                ScanPortsWithRegistry();
 
-                // Let user choose a device from the FIRMATA devices only
+                // Let user choose a device from the detected devices
                 var firmataDevices = _portScanResults.Where(p => p.IsFirmata).ToList();
 
                 if (firmataDevices.Count == 0)
@@ -48,13 +49,20 @@ namespace FirmataPRSBTestApp
                     continue;
                 }
 
-                // Connect to selected device using the known working profile
+                // Connect to selected device
                 var chosenDevice = firmataDevices[selected];
                 _device = new FirmataClient(chosenDevice.PortName, chosenDevice.Profile);
 
-                if (_device.Connect(1)) // Only 1 round needed since we know the profile
+
+                // Use device type information for better connection
+                bool connected = chosenDevice.DeviceType != "Unknown"
+                    ? _device.Connect(1, chosenDevice.DeviceType)
+                    : _device.Connect(1);
+
+                if (connected)
                 {
-                    Console.WriteLine($"\nConnected to {chosenDevice.PortName} (Firmata v{_device.Version})");
+                    Console.WriteLine($"\nConnected to {chosenDevice.PortName} ({chosenDevice.DeviceType})");
+                    Console.WriteLine($"Firmata v{_device.Version} detected");
                     RunDeviceMenu();
                 }
                 else
@@ -71,35 +79,43 @@ namespace FirmataPRSBTestApp
             Console.WriteLine("Press any key to exit...");
             Console.ReadKey();
         }
-
-        private static void ScanPorts(bool includeCom1 = false)
+        
+        private static void ScanPortsWithRegistry(bool includeCom1 = false)
         {
             _portScanResults.Clear();
-            var ports = SerialPort.GetPortNames()
+
+            // First, get devices from Windows Registry
+            Console.WriteLine("Querying Windows for connected devices...");
+            var registryDevices = WmiDeviceFinder.GetConnectedArduinoDevices();
+
+            if (registryDevices.Count > 0)
+            {
+                Console.WriteLine("\nWindows-detected devices:");
+                foreach (var device in registryDevices)
+                {
+                    Console.WriteLine($"  {device.Key}: {device.Value}");
+                }
+            }
+            else
+            {
+                Console.WriteLine("No Arduino devices found in Windows Registry.");
+            }
+
+            // Get all COM ports
+            var allPorts = SerialPort.GetPortNames()
                 .OrderBy(p => p)
                 .ToArray();
 
-            Console.WriteLine("\nAvailable COM Ports:");
-            foreach (var port in ports)
-            {
-                Console.WriteLine($"  {port}");
-            }
-
-            if (ports.Length == 0)
+            if (allPorts.Length == 0)
             {
                 Console.WriteLine("No COM ports found!");
                 return;
             }
 
-            // Filter ports based on includeCom1 flag
+            // Filter ports
             var portsToScan = includeCom1
-                ? ports
-                : ports.Where(p => !p.Equals("COM1", StringComparison.OrdinalIgnoreCase)).ToArray();
-
-            if (!includeCom1 && ports.Contains("COM1", StringComparer.OrdinalIgnoreCase))
-            {
-                Console.WriteLine("\nNote: COM1 is skipped by default (typically not used for Arduino devices)");
-            }
+                ? allPorts
+                : allPorts.Where(p => !p.Equals("COM1", StringComparison.OrdinalIgnoreCase)).ToArray();
 
             Console.WriteLine("\nScanning for Firmata devices...");
 
@@ -107,43 +123,79 @@ namespace FirmataPRSBTestApp
             {
                 Console.WriteLine($"\n=== Testing {port} ===");
 
+                // Check if Windows knows about this device
+                string deviceType = "Unknown";
+                if (registryDevices.TryGetValue(port, out var knownDevice))
+                {
+                    deviceType = knownDevice;
+                    Console.WriteLine($"Windows identifies: {deviceType}");
+                }
+
                 try
                 {
                     using var testClient = new FirmataClient(port);
-                    bool isConnected = testClient.Connect(2);
+                    bool isConnected;
 
-                    _portScanResults.Add((port, isConnected,
-                        isConnected ? testClient.Version : "",
-                        isConnected ? testClient.DetectedProfile : ""));
-
-                    if (isConnected)
+                    if (deviceType != "Unknown")
                     {
-                        Console.WriteLine($"✓ Firmata v{testClient.Version} detected ({testClient.DetectedProfile} profile)");
+                        // Use device-specific connection
+                        isConnected = testClient.ConnectWithDeviceType(deviceType);
                     }
                     else
                     {
-                        Console.WriteLine("✗ No Firmata device found");
+                        // Fallback to auto-detection
+                        isConnected = testClient.Connect(2);
+                    }
+
+                    _portScanResults.Add((port, isConnected,
+                        isConnected ? testClient.Version : "",
+                        isConnected ? testClient.DetectedProfile : "",
+                        deviceType));
+
+                    if (isConnected)
+                    {
+                        Console.WriteLine($"✓ Firmata v{testClient.Version} detected");
+                    }
+                    else
+                    {
+                        Console.WriteLine("✗ No Firmata response");
                     }
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine($"Error testing {port}: {ex.Message}");
-                    _portScanResults.Add((port, false, "", ""));
+                    _portScanResults.Add((port, false, "", "", deviceType));
                 }
 
-                Thread.Sleep(500);
+                Thread.Sleep(300); // Shorter delay since we're smarter now
             }
 
             Console.WriteLine("\nScan complete.");
         }
-
-        private static int SelectDevice(List<(string PortName, bool IsFirmata, string Version, string Profile)> firmataDevices)
+        public static Dictionary<string, string> SafeGetRegistryDevices()
+        {
+            try
+            {
+                return WmiDeviceFinder.GetConnectedArduinoDevices();
+            }
+            catch (System.Security.SecurityException)
+            {
+                Console.WriteLine("Note: Registry access denied. Using fallback detection.");
+                return new Dictionary<string, string>();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Registry access error: {ex.Message}");
+                return new Dictionary<string, string>();
+            }
+        }
+        private static int SelectDevice(List<(string PortName, bool IsFirmata, string Version, string Profile, string DeviceType)> firmataDevices)
         {
             Console.WriteLine("\nFirmata Devices Found:");
             for (int i = 0; i < firmataDevices.Count; i++)
             {
                 var device = firmataDevices[i];
-                Console.WriteLine($"{i}: {device.PortName} (v{device.Version}) - {device.Profile} profile");
+                Console.WriteLine($"{i}: {device.PortName} - {device.DeviceType} (v{device.Version})");
             }
 
             Console.WriteLine($"{firmataDevices.Count}: Rescan all ports");
